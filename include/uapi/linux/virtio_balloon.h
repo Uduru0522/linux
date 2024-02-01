@@ -48,6 +48,8 @@ struct virtio_balloon_config {
 	__le32 num_pages;
 	/* Number of pages we've actually got in balloon. */
 	__le32 actual;
+	/* ID of node we want to operate on */
+	__le32 node_id;
 	/*
 	 * Free page hint command id, readonly by guest.
 	 * Was previously named free_page_report_cmd_id so we

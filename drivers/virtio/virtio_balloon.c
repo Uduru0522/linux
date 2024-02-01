@@ -18,6 +18,7 @@
 #include <linux/wait.h>
 #include <linux/mm.h>
 #include <linux/page_reporting.h>
+#include <linux/gfp.h>
 
 /*
  * Balloon device works in 4K page units.  So each page is pointed to by
@@ -38,6 +39,8 @@
 #define VIRTIO_BALLOON_HINT_BLOCK_BYTES \
 	(1 << (VIRTIO_BALLOON_HINT_BLOCK_ORDER + PAGE_SHIFT))
 #define VIRTIO_BALLOON_HINT_BLOCK_PAGES (1 << VIRTIO_BALLOON_HINT_BLOCK_ORDER)
+/* The max number of NUMA nodes a system can have */ 
+#define MAX_NODES 8
 
 enum virtio_balloon_vq {
 	VIRTIO_BALLOON_VQ_INFLATE,
@@ -91,14 +94,14 @@ struct virtio_balloon {
 	wait_queue_head_t acked;
 
 	/* Number of balloon pages we've told the Host we're not using. */
-	unsigned int num_pages;
+	unsigned int num_pages[MAX_NODES];
 	/*
 	 * The pages we've told the Host we're not using are enqueued
 	 * at vb_dev_info->pages list.
 	 * Each page on this list adds VIRTIO_BALLOON_PAGES_PER_PAGE
 	 * to num_pages above.
 	 */
-	struct balloon_dev_info vb_dev_info;
+	struct balloon_dev_info vb_dev_info[MAX_NODES];
 
 	/* Synchronize access/update to this struct virtio_balloon elements */
 	struct mutex balloon_lock;
@@ -138,6 +141,15 @@ static u32 page_to_balloon_pfn(struct page *page)
 	BUILD_BUG_ON(PAGE_SHIFT < VIRTIO_BALLOON_PFN_SHIFT);
 	/* Convert pfn from Linux page size to balloon page size. */
 	return pfn * VIRTIO_BALLOON_PAGES_PER_PAGE;
+}
+
+/* Allocate new page on specified node */
+struct page *balloon_page_alloc_node(int node_id)
+{	
+	struct page *page = alloc_pages_node(node_id, balloon_mapping_gfp_mask() |
+				       __GFP_NOMEMALLOC | __GFP_NORETRY |
+				       __GFP_NOWARN, 0);
+	return page;
 }
 
 static void balloon_ack(struct virtqueue *vq)
@@ -206,7 +218,7 @@ static void set_page_pfns(struct virtio_balloon *vb,
 					  page_to_balloon_pfn(page) + i);
 }
 
-static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
+static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num, int node_id)
 {
 	unsigned int num_allocated_pages;
 	unsigned int num_pfns;
@@ -216,9 +228,10 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
 	/* We can only do one array worth at a time. */
 	num = min(num, ARRAY_SIZE(vb->pfns));
 
+	/*  Enqueue newly allocated pages into list */
 	for (num_pfns = 0; num_pfns < num;
 	     num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
-		struct page *page = balloon_page_alloc();
+		struct page *page = balloon_page_alloc_node(node_id);
 
 		if (!page) {
 			dev_info_ratelimited(&vb->vdev->dev,
@@ -236,11 +249,12 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
 
 	vb->num_pfns = 0;
 
+	/* assign newly allocated pages onto node */
 	while ((page = balloon_page_pop(&pages))) {
-		balloon_page_enqueue(&vb->vb_dev_info, page);
+		balloon_page_enqueue(&vb->vb_dev_info[node_id], page);
 
 		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
-		vb->num_pages += VIRTIO_BALLOON_PAGES_PER_PAGE;
+		vb->num_pages[node_id] += VIRTIO_BALLOON_PAGES_PER_PAGE;
 		if (!virtio_has_feature(vb->vdev,
 					VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
 			adjust_managed_page_count(page, -1);
@@ -270,11 +284,12 @@ static void release_pages_balloon(struct virtio_balloon *vb,
 	}
 }
 
-static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
+/* Release memory from the balloon */
+static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num, int node_id)
 {
 	unsigned int num_freed_pages;
 	struct page *page;
-	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info;
+	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info[node_id];
 	LIST_HEAD(pages);
 
 	/* We can only do one array worth at a time. */
@@ -282,7 +297,7 @@ static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
 
 	mutex_lock(&vb->balloon_lock);
 	/* We can't release more pages than taken */
-	num = min(num, (size_t)vb->num_pages);
+	num = min(num, (size_t)vb->num_pages[node_id]);
 	for (vb->num_pfns = 0; vb->num_pfns < num;
 	     vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
 		page = balloon_page_dequeue(vb_dev_info);
@@ -290,7 +305,7 @@ static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
 			break;
 		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
 		list_add(&page->lru, &pages);
-		vb->num_pages -= VIRTIO_BALLOON_PAGES_PER_PAGE;
+		vb->num_pages[node_id] -= VIRTIO_BALLOON_PAGES_PER_PAGE;
 	}
 
 	num_freed_pages = vb->num_pfns;
@@ -394,7 +409,8 @@ static void stats_handle_request(struct virtio_balloon *vb)
 static inline s64 towards_target(struct virtio_balloon *vb)
 {
 	s64 target;
-	u32 num_pages;
+	u32 num_pages, node_id = virtio_cread_le(vb->dev, 
+						struct virtio_balloon_config, node_id, &node_id);;
 
 	/* Legacy balloon config space is LE, unlike all other devices. */
 	virtio_cread_le(vb->vdev, struct virtio_balloon_config, num_pages,
@@ -405,7 +421,7 @@ static inline s64 towards_target(struct virtio_balloon *vb)
 	 * balloon endlessly.
 	 */
 	target = ALIGN(num_pages, VIRTIO_BALLOON_PAGES_PER_PAGE);
-	return target - vb->num_pages;
+	return target - vb->num_pages[node_id];
 }
 
 /* Gives back @num_to_return blocks of free pages to mm. */
@@ -480,9 +496,9 @@ static void virtballoon_changed(struct virtio_device *vdev)
 	spin_unlock_irqrestore(&vb->stop_update_lock, flags);
 }
 
-static void update_balloon_size(struct virtio_balloon *vb)
+static void update_balloon_size(struct virtio_balloon *vb, int node_id)
 {
-	u32 actual = vb->num_pages;
+	u32 actual = vb->num_pages[node_id];
 
 	/* Legacy balloon config space is LE, unlike all other devices. */
 	virtio_cwrite_le(vb->vdev, struct virtio_balloon_config, actual,
@@ -502,22 +518,27 @@ static void update_balloon_size_func(struct work_struct *work)
 {
 	struct virtio_balloon *vb;
 	s64 diff;
+	u32 node_id;
 
 	vb = container_of(work, struct virtio_balloon,
 			  update_balloon_size_work);
+
+	node_id = virtio_cread_le(vb->dev, struct virtio_balloon_config, 
+					node_id, &node_id);
 
 	spin_lock_irq(&vb->adjustment_lock);
 	vb->adjustment_signal_pending = false;
 	spin_unlock_irq(&vb->adjustment_lock);
 
 	diff = towards_target(vb);
+	
 
 	if (diff) {
 		if (diff > 0)
-			diff -= fill_balloon(vb, diff);
+			diff -= fill_balloon(vb, diff, node_id);
 		else
-			diff += leak_balloon(vb, -diff);
-		update_balloon_size(vb);
+			diff += leak_balloon(vb, -diff, node_id);
+		update_balloon_size(vb, node_id);
 	}
 
 	if (diff)
@@ -873,11 +894,13 @@ static int virtio_balloon_oom_notify(struct notifier_block *nb,
 {
 	struct virtio_balloon *vb = container_of(nb,
 						 struct virtio_balloon, oom_nb);
+	u32 node_id = virtio_cread_le(vb->dev, 
+						struct virtio_balloon_config, node_id, &node_id);
 	unsigned long *freed = parm;
 
-	*freed += leak_balloon(vb, VIRTIO_BALLOON_OOM_NR_PAGES) /
+	*freed += leak_balloon(vb, VIRTIO_BALLOON_OOM_NR_PAGES, node_id) /
 		  VIRTIO_BALLOON_PAGES_PER_PAGE;
-	update_balloon_size(vb);
+	update_balloon_size(vb, node_id);
 
 	return NOTIFY_OK;
 }
@@ -926,7 +949,8 @@ static int virtballoon_probe(struct virtio_device *vdev)
 	init_waitqueue_head(&vb->acked);
 	vb->vdev = vdev;
 
-	balloon_devinfo_init(&vb->vb_dev_info);
+	for(int i = 0; i < MAX_NODES; ++i)
+		balloon_devinfo_init(&vb->vb_dev_info[i]);
 
 	err = init_vqs(vb);
 	if (err)
@@ -1055,9 +1079,11 @@ out:
 static void remove_common(struct virtio_balloon *vb)
 {
 	/* There might be pages left in the balloon: free them. */
-	while (vb->num_pages)
-		leak_balloon(vb, vb->num_pages);
-	update_balloon_size(vb);
+	for(int i = 0; i < MAX_NODES; ++i){
+		while (vb->num_pages)
+			leak_balloon(vb, vb->num_pages[i], i);
+		update_balloon_size(vb);
+	}
 
 	/* There might be free pages that are being reported: release them. */
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
