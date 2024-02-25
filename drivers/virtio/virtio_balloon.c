@@ -144,7 +144,7 @@ static u32 page_to_balloon_pfn(struct page *page)
 }
 
 /* Allocate new page on specified node */
-struct page *balloon_page_alloc_node(int node_id)
+static struct page *balloon_page_alloc_node(int node_id)
 {	
 	struct page *page = alloc_pages_node(node_id, balloon_mapping_gfp_mask() |
 				       __GFP_NOMEMALLOC | __GFP_NORETRY |
@@ -409,8 +409,10 @@ static void stats_handle_request(struct virtio_balloon *vb)
 static inline s64 towards_target(struct virtio_balloon *vb)
 {
 	s64 target;
-	u32 num_pages, node_id = virtio_cread_le(vb->dev, 
-						struct virtio_balloon_config, node_id, &node_id);;
+	u32 num_pages, node_id;
+	
+	virtio_cread_le(vb->vdev, 
+						struct virtio_balloon_config, node_id, &node_id);
 
 	/* Legacy balloon config space is LE, unlike all other devices. */
 	virtio_cread_le(vb->vdev, struct virtio_balloon_config, num_pages,
@@ -523,7 +525,7 @@ static void update_balloon_size_func(struct work_struct *work)
 	vb = container_of(work, struct virtio_balloon,
 			  update_balloon_size_work);
 
-	node_id = virtio_cread_le(vb->dev, struct virtio_balloon_config, 
+	virtio_cread_le(vb->vdev, struct virtio_balloon_config, 
 					node_id, &node_id);
 
 	spin_lock_irq(&vb->adjustment_lock);
@@ -807,7 +809,7 @@ static int virtballoon_migratepage(struct balloon_dev_info *vb_dev_info,
 		struct page *newpage, struct page *page, enum migrate_mode mode)
 {
 	struct virtio_balloon *vb = container_of(vb_dev_info,
-			struct virtio_balloon, vb_dev_info);
+			struct virtio_balloon, vb_dev_info[page_to_nid(page)]);
 	unsigned long flags;
 
 	/*
@@ -894,7 +896,8 @@ static int virtio_balloon_oom_notify(struct notifier_block *nb,
 {
 	struct virtio_balloon *vb = container_of(nb,
 						 struct virtio_balloon, oom_nb);
-	u32 node_id = virtio_cread_le(vb->dev, 
+	u32 node_id;
+	virtio_cread_le(vb->vdev, 
 						struct virtio_balloon_config, node_id, &node_id);
 	unsigned long *freed = parm;
 
@@ -949,16 +952,17 @@ static int virtballoon_probe(struct virtio_device *vdev)
 	init_waitqueue_head(&vb->acked);
 	vb->vdev = vdev;
 
-	for(int i = 0; i < MAX_NODES; ++i)
+	for(int i = 0; i < MAX_NODES; ++i){
 		balloon_devinfo_init(&vb->vb_dev_info[i]);
+#ifdef CONFIG_BALLOON_COMPACTION
+		vb->vb_dev_info[i].migratepage = virtballoon_migratepage;
+#endif
+	}
 
 	err = init_vqs(vb);
 	if (err)
 		goto out_free_vb;
 
-#ifdef CONFIG_BALLOON_COMPACTION
-	vb->vb_dev_info.migratepage = virtballoon_migratepage;
-#endif
 	if (virtio_has_feature(vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT)) {
 		/*
 		 * There is always one entry reserved for cmd id, so the ring
@@ -1082,7 +1086,7 @@ static void remove_common(struct virtio_balloon *vb)
 	for(int i = 0; i < MAX_NODES; ++i){
 		while (vb->num_pages)
 			leak_balloon(vb, vb->num_pages[i], i);
-		update_balloon_size(vb);
+		update_balloon_size(vb, i);
 	}
 
 	/* There might be free pages that are being reported: release them. */
@@ -1146,7 +1150,9 @@ static int virtballoon_restore(struct virtio_device *vdev)
 
 	if (towards_target(vb))
 		virtballoon_changed(vdev);
-	update_balloon_size(vb);
+
+	for(int i = 0; i < MAX_NODES; ++i)
+		update_balloon_size(vb, i);
 	return 0;
 }
 #endif
